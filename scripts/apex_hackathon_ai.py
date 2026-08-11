@@ -2,13 +2,14 @@
 ================================================================================
  APEX HACKATHON AI — LangGraph Implementation
 ================================================================================
- A bounded cyclic multi-agent graph that turns a hackathon problem statement
- into an APPROVED, $0-budget, novel technical design plus full deliverables
+ A bounded cyclic multi-agent graph that ingests MULTIPLE hackathon problem
+ statements, autonomously selects the most viable one, and turns it into an
+ APPROVED, $0-budget, novel technical design plus full deliverables
  (6-slide SIH pitch deck outline + runnable repository scaffold).
 
  GRAPH TOPOLOGY
  --------------
-   START -> adversarial_researcher -> shoestring_architect -> red_team_judge
+   START -> problem_selector -> adversarial_researcher -> shoestring_architect -> red_team_judge
    red_team_judge --(APPROVED)-------------> deliverables_master -> END
    red_team_judge --(REJECT_DESIGN)--------> shoestring_architect
    red_team_judge --(REJECT_CONCEPT)-------> adversarial_researcher
@@ -68,6 +69,15 @@ load_dotenv()
 # ==============================================================================
 # 1. PYDANTIC SCHEMAS — guarantee route_from_judge never sees malformed data
 # ==============================================================================
+
+
+class ProblemSelection(BaseModel):
+    """Structured output of the Problem Selector node."""
+
+    selected_problem: str = Field(description="The exact text of the winning problem statement.")
+    reasoning: str = Field(
+        description="A 1-sentence justification of why this is the most viable for a $0 budget and high novelty."
+    )
 
 
 class MarketFlaw(BaseModel):
@@ -161,6 +171,7 @@ class Deliverables(BaseModel):
 
 class ApexState(TypedDict, total=False):
     # ── OVERWRITTEN each pass (last-write-wins) ───────────────────────────────
+    candidate_problems: List[str]
     problem_statement: str
     innovation_gap: str
     current_design: Optional[TechDesign]
@@ -289,6 +300,68 @@ def web_search(query: str, max_results: int = 5) -> str:
 # ==============================================================================
 # 5. NODE IMPLEMENTATIONS
 # ==============================================================================
+
+# ── Node 0: Problem Selector ──────────────────────────────────────────────────
+
+SELECTOR_SYSTEM_PROMPT = """You are the HACKATHON STRATEGIST in a hackathon strategy pipeline.
+
+Your job: from a list of candidate problem statements, select the SINGLE problem
+that has the highest potential for a highly novel, $0-budget, open-source tech
+solution buildable by a small student team.
+
+SELECTION CRITERIA:
+1. NOVELTY POTENTIAL: prefer problems where the existing solution landscape has
+   documented gaps that a genuinely original architectural or algorithmic
+   contribution could claim — not problems already saturated with polished
+   products or prior hackathon winners.
+2. $0-BUDGET VIABILITY: prefer problems solvable entirely with free/open-source
+   tooling on commodity hardware. Penalize problems that inherently require paid
+   infrastructure, proprietary datasets, specialized sensors, or regulatory
+   approval to demo.
+3. DEMO-ABILITY: prefer problems where a compelling, working MVP can be shown
+   within a hackathon timeframe.
+
+OUTPUT REQUIREMENTS:
+- selected_problem: the EXACT, verbatim text of the winning problem statement
+  from the candidate list. Do not paraphrase, trim, or merge candidates.
+- reasoning: exactly one sentence justifying why this problem is the most viable
+  for a $0 budget and high novelty.
+
+Output strictly in the requested structured format."""
+
+
+def problem_selector(state: ApexState) -> dict:
+    print(f"\n{'=' * 70}\n[NODE] Problem Selector\n{'=' * 70}")
+
+    candidates = state["candidate_problems"]
+    print(f"[selector] evaluating {len(candidates)} candidate problem(s)...")
+
+    if len(candidates) == 1:
+        # Trivial case: one candidate needs no LLM call.
+        print("[selector] single candidate provided; selecting it directly.")
+        return {"problem_statement": candidates[0]}
+
+    candidates_text = "\n\n".join(
+        f"CANDIDATE {i + 1}:\n{p}" for i, p in enumerate(candidates)
+    )
+
+    user_prompt = f"""CANDIDATE PROBLEM STATEMENTS:
+
+{candidates_text}
+
+Select the single most viable problem for a highly novel, $0-budget, open-source
+hackathon solution. Return the winning problem statement's EXACT text and a
+1-sentence justification."""
+
+    result: ProblemSelection = invoke_structured_with_retry(
+        "problem_selector", ProblemSelection, SELECTOR_SYSTEM_PROMPT, user_prompt
+    )
+
+    print(f"[selector] selected: {result.selected_problem[:200]}")
+    print(f"[selector] reasoning: {result.reasoning}")
+
+    return {"problem_statement": result.selected_problem}
+
 
 # ── Node 1: Adversarial Researcher ────────────────────────────────────────────
 
@@ -714,13 +787,15 @@ def route_from_judge(state: ApexState) -> str:
 def build_graph():
     graph = StateGraph(ApexState)
 
+    graph.add_node("problem_selector", problem_selector)
     graph.add_node("adversarial_researcher", adversarial_researcher)
     graph.add_node("shoestring_architect", shoestring_architect)
     graph.add_node("red_team_judge", red_team_judge)
     graph.add_node("best_effort_finalizer", best_effort_finalizer)
     graph.add_node("deliverables_master", deliverables_master)
 
-    graph.add_edge(START, "adversarial_researcher")
+    graph.add_edge(START, "problem_selector")
+    graph.add_edge("problem_selector", "adversarial_researcher")
     graph.add_edge("adversarial_researcher", "shoestring_architect")
     graph.add_edge("shoestring_architect", "red_team_judge")
 
@@ -749,11 +824,12 @@ def build_graph():
 # ==============================================================================
 
 
-def run_apex(problem_statement: str, max_iterations: int = 4) -> ApexState:
+def run_apex(candidate_problems: List[str], max_iterations: int = 4) -> ApexState:
     app = build_graph()
 
     initial_state: ApexState = {
-        "problem_statement": problem_statement,
+        "candidate_problems": candidate_problems,
+        "problem_statement": "",
         "innovation_gap": "",
         "current_design": None,
         "judge_verdict": "PENDING",
@@ -772,25 +848,49 @@ def run_apex(problem_statement: str, max_iterations: int = 4) -> ApexState:
 
 
 if __name__ == "__main__":
-    SAMPLE_PROBLEM = (
-        "SIH Problem Statement: Rural primary health centers in India lack reliable "
-        "tools for early screening of anemia and malnutrition in children under 5. "
-        "Health workers operate with intermittent connectivity, low-end Android "
-        "phones, and no budget for cloud services. Build a technology solution that "
-        "enables accurate, offline-first screening and longitudinal tracking, and "
-        "syncs opportunistically when connectivity appears."
+    print("=" * 70)
+    print(" APEX HACKATHON AI — problem intake")
+    print("=" * 70)
+    print(
+        "Paste a hackathon problem statement and press Enter to add it.\n"
+        "Type 'DONE' (on its own line) when you have added all candidates.\n"
+        "At least 1 problem statement is required before typing 'DONE'.\n"
     )
 
-    print("=" * 70)
+    candidate_problems: List[str] = []
+    while True:
+        try:
+            entry = input(f"[{len(candidate_problems) + 1}] Problem statement (or 'DONE'): ").strip()
+        except EOFError:
+            entry = "DONE"
+
+        if entry.upper() == "DONE":
+            if candidate_problems:
+                break
+            print("You must enter at least 1 problem statement before typing 'DONE'.\n")
+            continue
+
+        if not entry:
+            print("Empty input ignored. Paste a problem statement or type 'DONE'.\n")
+            continue
+
+        candidate_problems.append(entry)
+        print(f"Added. ({len(candidate_problems)} candidate(s) so far)\n")
+
+    print("\n" + "=" * 70)
     print(" APEX HACKATHON AI — starting run")
     print("=" * 70)
-    print(f"Problem: {SAMPLE_PROBLEM}\n")
+    print(f"Candidates: {len(candidate_problems)}")
+    for i, p in enumerate(candidate_problems, start=1):
+        print(f"  [{i}] {p[:120]}{'...' if len(p) > 120 else ''}")
+    print()
 
-    result = run_apex(SAMPLE_PROBLEM, max_iterations=4)
+    result = run_apex(candidate_problems, max_iterations=4)
 
     print("\n" + "=" * 70)
     print(" FINAL RESULT")
     print("=" * 70)
+    print(f"Selected problem: {result['problem_statement'][:200]}")
     print(f"Verdict:      {result['judge_verdict']}")
     print(f"Iterations:   {result['iteration_count']}")
     print(f"Designs seen: {len(result['design_history'])}")
